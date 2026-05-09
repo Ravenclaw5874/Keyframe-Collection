@@ -291,6 +291,12 @@ class KFCOLLECTION_OT_manage(bpy.types.Operator):
                 ctrl_obj.kf_collections_index = max_idx
 
         wm.kf_popup_items.clear()
+
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+
         return {"FINISHED"}
 
 
@@ -384,8 +390,24 @@ class KFCOLLECTION_PT_panel(bpy.types.Panel):
 
 
 # --- [6] 애니메이션 동기화 핸들러 ---
+_is_rendering = False
+
+
+@persistent
+def kf_render_set(scene):
+    global _is_rendering
+    _is_rendering = True
+
+
+@persistent
+def kf_render_clear(scene):
+    global _is_rendering
+    _is_rendering = False
+
+
 @persistent
 def kf_collection_handler(scene):
+    global _is_rendering
     ctrl_obj = scene.kf_ctrl_obj
     if not ctrl_obj:
         return
@@ -401,7 +423,7 @@ def kf_collection_handler(scene):
                 item.collection.hide_render = item.kf_hide_render
                 is_changed = True
 
-    if is_changed and not bpy.app.background:
+    if is_changed and not bpy.app.background and not _is_rendering:
         if getattr(bpy.context, "view_layer", None):
             bpy.context.view_layer.update()
 
@@ -468,6 +490,12 @@ def register():
     if kf_collection_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(kf_collection_depsgraph_handler)
 
+    if kf_render_set not in bpy.app.handlers.render_init:
+        bpy.app.handlers.render_init.append(kf_render_set)
+    if kf_render_clear not in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.append(kf_render_clear)
+        bpy.app.handlers.render_cancel.append(kf_render_clear)
+
 
 def unregister():
     for cls in reversed(classes):
@@ -483,6 +511,13 @@ def unregister():
         bpy.app.handlers.frame_change_post.remove(kf_collection_handler)
     if kf_collection_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(kf_collection_depsgraph_handler)
+
+    if kf_render_set in bpy.app.handlers.render_init:
+        bpy.app.handlers.render_init.remove(kf_render_set)
+    if kf_render_clear in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.remove(kf_render_clear)
+    if kf_render_clear in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.remove(kf_render_clear)
 
 
 if __name__ == "__main__":
