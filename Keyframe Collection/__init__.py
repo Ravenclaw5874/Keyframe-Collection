@@ -39,11 +39,6 @@ class KFCollectionItem(bpy.types.PropertyGroup):
     )
 
 
-class KFPopupItem(bpy.types.PropertyGroup):
-    col_name: bpy.props.StringProperty()
-    is_selected: bpy.props.BoolProperty(default=False)
-
-
 # --- [3] UI 리스트 렌더링 ---
 class KFCOLLECTION_UL_list(bpy.types.UIList):
     def filter_items(self, context, data, propname):
@@ -111,186 +106,154 @@ class KFCOLLECTION_UL_list(bpy.types.UIList):
                 row.label(text="No Collection", icon="ERROR")
 
 
-class KFCOLLECTION_UL_popup_list(bpy.types.UIList):
-    def draw_item(
-        self, context, layout, data, item, icon, active_data, active_propname
-    ):
-        row = layout.row(align=True)
-        row.prop(item, "is_selected", text="")
-        row.label(text=item.col_name, icon="OUTLINER_COLLECTION")
+# --- 이름 동기화 함수 (Depsgraph 낭비 제거용) ---
+def sync_collection_names(ctrl_obj):
+    if not ctrl_obj:
+        return
+
+    rename_map = {}
+    for item in ctrl_obj.kf_collections:
+        if item.collection and item.name != item.collection.name:
+            if item.name != "":
+                rename_map[item.name] = item.collection.name
+            item.name = item.collection.name
+
+    if rename_map and ctrl_obj.animation_data and ctrl_obj.animation_data.action:
+        action = ctrl_obj.animation_data.action
+        for fc in action.fcurves:
+            for old_name, new_name in rename_map.items():
+                if f'["{old_name}"]' in fc.data_path:
+                    fc.data_path = fc.data_path.replace(
+                        f'["{old_name}"]', f'["{new_name}"]'
+                    )
+                elif f"['{old_name}']" in fc.data_path:
+                    fc.data_path = fc.data_path.replace(
+                        f"['{old_name}']", f'["{new_name}"]'
+                    )
 
 
-# --- [4] 통합 관리 오퍼레이터 (팝업창) ---
-class KFCOLLECTION_OT_manage(bpy.types.Operator):
-    bl_idname = "kf_collection.manage"
-    bl_label = "Manage Collections"
-    bl_description = "Add or remove collections to control"
-    bl_options = {"REGISTER", "INTERNAL"}
+# --- [4] 통합 관리 오퍼레이터 (Add/Remove 교체) ---
+class KFCOLLECTION_OT_add(bpy.types.Operator):
+    bl_idname = "kf_collection.add"
+    bl_label = "Add Active Collection"
+    bl_description = "Add the currently active collection in the outliner to the list"
+    bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
-        return True
-
-    def invoke(self, context, event):
-        scene = context.scene
-        wm = context.window_manager
-        wm.kf_popup_items.clear()
-
-        ctrl_obj = scene.kf_ctrl_obj
-
-        if ctrl_obj:
-            if all(item.sort_index == 0 for item in ctrl_obj.kf_collections):
-                for i, item in enumerate(ctrl_obj.kf_collections):
-                    item.sort_index = i
-
-            # 아웃라이너에서 컬렉션이 삭제된 경우 처리 (PointerProperty가 끊어진 슬롯)
-            for i, item in enumerate(ctrl_obj.kf_collections):
-                if not item.collection and item.is_managed:
-                    item.is_managed = False
-
-                    if ctrl_obj.animation_data and ctrl_obj.animation_data.action:
-                        action = ctrl_obj.animation_data.action
-                        paths = [
-                            f"kf_collections[{i}].kf_hide_viewport",
-                            f"kf_collections[{i}].kf_hide_render",
-                            f'kf_collections["{item.name}"].kf_hide_viewport',
-                            f'kf_collections["{item.name}"].kf_hide_render',
-                        ]
-                        for fc in list(action.fcurves):
-                            if fc.data_path in paths:
-                                fc.data_path = fc.data_path.replace(
-                                    "kf_hide_", "MISSING_kf_hide_"
-                                )
-
-        existing_cols = set()
-
-        if ctrl_obj:
-            existing_cols = {
-                item.collection.name
-                for item in ctrl_obj.kf_collections
-                if item.collection and item.is_managed
-            }
-
-        for col in bpy.data.collections:
-            new_item = wm.kf_popup_items.add()
-            new_item.name = col.name
-            new_item.col_name = col.name
-            new_item.is_selected = col.name in existing_cols
-
-        return context.window_manager.invoke_props_dialog(self, width=350)
-
-    def draw(self, context):
-        layout = self.layout
-        wm = context.window_manager
-
-        if len(wm.kf_popup_items) == 0:
-            layout.label(text="No collections in the scene.", icon="INFO")
-            return
-
-        layout.label(text="Check to add, uncheck to remove:")
-        layout.template_list(
-            "KFCOLLECTION_UL_popup_list",
-            "",
-            wm,
-            "kf_popup_items",
-            wm,
-            "kf_popup_index",
-            rows=10,
-        )
+        return context.collection is not None
 
     def execute(self, context):
         scene = context.scene
-        wm = context.window_manager
-        any_checked = any(item.is_selected for item in wm.kf_popup_items)
+        col = context.collection
 
         ctrl_obj = scene.kf_ctrl_obj
-        if any_checked and not ctrl_obj:
+        if not ctrl_obj:
             ctrl_obj = bpy.data.objects.new(CTRL_NAME, None)
             ctrl_obj.empty_display_type = "ARROWS"
             scene.collection.objects.link(ctrl_obj)
             scene.kf_ctrl_obj = ctrl_obj
 
-        if ctrl_obj:
-            existing_cols = {
-                item.collection.name
-                for item in ctrl_obj.kf_collections
-                if item.collection and item.is_managed
+        sync_collection_names(ctrl_obj)
+
+        existing_idx = -1
+        for idx, item in enumerate(ctrl_obj.kf_collections):
+            if item.collection == col:
+                existing_idx = idx
+                break
+
+        if existing_idx >= 0:
+            new_item = ctrl_obj.kf_collections[existing_idx]
+            if new_item.is_managed:
+                return {"CANCELLED"}
+
+            new_item.is_managed = True
+            new_item.name = col.name
+            max_sort = max([item.sort_index for item in ctrl_obj.kf_collections] + [-1])
+            new_item.sort_index = max_sort + 1
+
+            # F-curve 최적화: 추가 시 단일 패스 순회
+            if ctrl_obj.animation_data and ctrl_obj.animation_data.action:
+                action = ctrl_obj.animation_data.action
+                disabled_paths = {
+                    f"kf_collections[{existing_idx}].MISSING_kf_hide_viewport",
+                    f"kf_collections[{existing_idx}].MISSING_kf_hide_render",
+                    f'kf_collections["{col.name}"].MISSING_kf_hide_viewport',
+                    f'kf_collections["{col.name}"].MISSING_kf_hide_render',
+                }
+                for fc in action.fcurves:
+                    if fc.data_path in disabled_paths:
+                        fc.data_path = fc.data_path.replace(
+                            "MISSING_kf_hide_", "kf_hide_"
+                        )
+
+        else:
+            new_item = ctrl_obj.kf_collections.add()
+            new_item.collection = col
+            new_item.name = col.name
+            new_item.is_managed = True
+            max_sort = max([item.sort_index for item in ctrl_obj.kf_collections] + [-1])
+            new_item.sort_index = max_sort + 1
+            new_item.kf_hide_viewport = col.hide_viewport
+            new_item.kf_hide_render = col.hide_render
+
+        ctrl_obj.kf_collections_index = len(ctrl_obj.kf_collections) - 1
+
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+
+        return {"FINISHED"}
+
+
+class KFCOLLECTION_OT_remove(bpy.types.Operator):
+    bl_idname = "kf_collection.remove"
+    bl_label = "Remove Selected Collection"
+    bl_description = "Remove the selected collection from the list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        ctrl_obj = context.scene.kf_ctrl_obj
+        return ctrl_obj and len(ctrl_obj.kf_collections) > 0
+
+    def execute(self, context):
+        ctrl_obj = context.scene.kf_ctrl_obj
+        idx = ctrl_obj.kf_collections_index
+
+        if idx < 0 or idx >= len(ctrl_obj.kf_collections):
+            return {"CANCELLED"}
+
+        item = ctrl_obj.kf_collections[idx]
+        if not item.is_managed:
+            return {"CANCELLED"}
+
+        sync_collection_names(ctrl_obj)
+
+        item.is_managed = False
+
+        # F-curve 최적화: 삭제 시 단일 패스 순회
+        if ctrl_obj.animation_data and ctrl_obj.animation_data.action:
+            action = ctrl_obj.animation_data.action
+            paths = {
+                f"kf_collections[{idx}].kf_hide_viewport",
+                f"kf_collections[{idx}].kf_hide_render",
+                f'kf_collections["{item.name}"].kf_hide_viewport',
+                f'kf_collections["{item.name}"].kf_hide_render',
             }
+            for fc in action.fcurves:
+                if fc.data_path in paths:
+                    fc.data_path = fc.data_path.replace("kf_hide_", "MISSING_kf_hide_")
 
-            items_to_add = []
-            items_to_remove = []
-
-            for p_item in wm.kf_popup_items:
-                if p_item.is_selected and p_item.col_name not in existing_cols:
-                    items_to_add.append(p_item.col_name)
-                elif not p_item.is_selected and p_item.col_name in existing_cols:
-                    items_to_remove.append(p_item.col_name)
-
-            for i, item in enumerate(ctrl_obj.kf_collections):
-                if item.collection and item.collection.name in items_to_remove:
-                    item.is_managed = False
-
-                    if ctrl_obj.animation_data and ctrl_obj.animation_data.action:
-                        action = ctrl_obj.animation_data.action
-                        paths = [
-                            f"kf_collections[{i}].kf_hide_viewport",
-                            f"kf_collections[{i}].kf_hide_render",
-                            f'kf_collections["{item.name}"].kf_hide_viewport',
-                            f'kf_collections["{item.name}"].kf_hide_render',
-                        ]
-                        for fc in list(action.fcurves):
-                            if fc.data_path in paths:
-                                fc.data_path = fc.data_path.replace(
-                                    "kf_hide_", "MISSING_kf_hide_"
-                                )
-
-            for name in items_to_add:
-                col = bpy.data.collections.get(name)
-                if col:
-                    max_sort = max(
-                        [item.sort_index for item in ctrl_obj.kf_collections] + [-1]
-                    )
-
-                    # 이름이 아닌 순수 컬렉션 참조(포인터)로 기존 슬롯 탐색
-                    existing_idx = -1
-                    for idx, item in enumerate(ctrl_obj.kf_collections):
-                        if item.collection == col:
-                            existing_idx = idx
-                            break
-
-                    if existing_idx >= 0:
-                        new_item = ctrl_obj.kf_collections[existing_idx]
-                        new_item.is_managed = True
-                        new_item.name = col.name
-                        new_item.sort_index = max_sort + 1
-
-                        if ctrl_obj.animation_data and ctrl_obj.animation_data.action:
-                            action = ctrl_obj.animation_data.action
-                            disabled_paths = [
-                                f"kf_collections[{existing_idx}].MISSING_kf_hide_viewport",
-                                f"kf_collections[{existing_idx}].MISSING_kf_hide_render",
-                                f'kf_collections["{col.name}"].MISSING_kf_hide_viewport',
-                                f'kf_collections["{col.name}"].MISSING_kf_hide_render',
-                            ]
-                            for fc in list(action.fcurves):
-                                if fc.data_path in disabled_paths:
-                                    fc.data_path = fc.data_path.replace(
-                                        "MISSING_kf_hide_", "kf_hide_"
-                                    )
-                    else:
-                        new_item = ctrl_obj.kf_collections.add()
-                        new_item.collection = col
-                        new_item.name = col.name
-                        new_item.is_managed = True
-                        new_item.sort_index = max_sort + 1
-                        new_item.kf_hide_viewport = col.hide_viewport
-                        new_item.kf_hide_render = col.hide_render
-
-            max_idx = max(0, len(ctrl_obj.kf_collections) - 1)
-            if ctrl_obj.kf_collections_index > max_idx:
-                ctrl_obj.kf_collections_index = max_idx
-
-        wm.kf_popup_items.clear()
+        # 보이는 아이템 목록을 기준으로 새 인덱스 위치 보정 시도
+        visible_indices = [
+            i for i, it in enumerate(ctrl_obj.kf_collections) if it.is_managed
+        ]
+        if visible_indices:
+            ctrl_obj.kf_collections_index = visible_indices[-1]
+        else:
+            ctrl_obj.kf_collections_index = 0
 
         for window in context.window_manager.windows:
             for area in window.screen.areas:
@@ -318,7 +281,6 @@ class KFCOLLECTION_OT_move(bpy.types.Operator):
         ctrl_obj = context.scene.kf_ctrl_obj
         idx = ctrl_obj.kf_collections_index
 
-        # 안전장치: sort_index가 모두 0이거나 중복이 있으면 초기화
         sort_indices = [item.sort_index for item in ctrl_obj.kf_collections]
         if len(set(sort_indices)) < len(sort_indices):
             for i, item in enumerate(ctrl_obj.kf_collections):
@@ -362,108 +324,118 @@ class KFCOLLECTION_PT_panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-
         ctrl_obj = context.scene.kf_ctrl_obj
 
-        if ctrl_obj and len(ctrl_obj.kf_collections) > 0:
-            row = layout.row()
-            row.template_list(
-                "KFCOLLECTION_UL_list",
-                "",
-                ctrl_obj,
-                "kf_collections",
-                ctrl_obj,
-                "kf_collections_index",
-            )
+        row = layout.row()
 
-            col = row.column(align=True)
-            col.operator("kf_collection.manage", icon="PREFERENCES", text="")
-            col.separator()
-            col.operator("kf_collection.move", icon="TRIA_UP", text="").direction = "UP"
-            col.operator(
-                "kf_collection.move", icon="TRIA_DOWN", text=""
-            ).direction = "DOWN"
+        if ctrl_obj:
+            data_ptr = ctrl_obj
+            prop_name = "kf_collections"
+            idx_name = "kf_collections_index"
         else:
-            layout.operator(
-                "kf_collection.manage", text="Manage Collections", icon="PREFERENCES"
-            )
+            data_ptr = context.scene
+            prop_name = "kf_dummy_collections"
+            idx_name = "kf_dummy_index"
+
+        row.template_list(
+            "KFCOLLECTION_UL_list",
+            "",
+            data_ptr,
+            prop_name,
+            data_ptr,
+            idx_name,
+        )
+
+        col = row.column(align=True)
+        col.operator("kf_collection.add", icon="ADD", text="")
+        col.operator("kf_collection.remove", icon="REMOVE", text="")
+        col.separator()
+        col.operator("kf_collection.move", icon="TRIA_UP", text="").direction = "UP"
+        col.operator("kf_collection.move", icon="TRIA_DOWN", text="").direction = "DOWN"
 
 
 # --- [6] 애니메이션 동기화 핸들러 ---
-_is_rendering = False
+def shift_kf_hide_render_keyframes(scene, shift_amount):
+    ctrl_obj = scene.kf_ctrl_obj
+    if (
+        not ctrl_obj
+        or not ctrl_obj.animation_data
+        or not ctrl_obj.animation_data.action
+    ):
+        return
+
+    action = ctrl_obj.animation_data.action
+
+    # F-curve 최적화: 변경해야 할 타겟 경로를 미리 취합 (단일 패스 순회)
+    target_paths = set()
+    for i, item in enumerate(ctrl_obj.kf_collections):
+        if item.collection and item.is_managed:
+            target_paths.add(f"kf_collections[{i}].kf_hide_render")
+            target_paths.add(f'kf_collections["{item.name}"].kf_hide_render')
+            target_paths.add(f"kf_collections['{item.name}'].kf_hide_render")
+
+    if not target_paths:
+        return
+
+    for fc in action.fcurves:
+        if fc.data_path in target_paths:
+            for kp in fc.keyframe_points:
+                kp.co[0] += shift_amount
+                kp.handle_left[0] += shift_amount
+                kp.handle_right[0] += shift_amount
+            fc.update()
 
 
 @persistent
 def kf_render_set(scene):
-    global _is_rendering
-    _is_rendering = True
+    scene.kf_original_frame = scene.frame_current
+
+    start_frame = (
+        scene.frame_preview_start if scene.use_preview_range else scene.frame_start
+    )
+
+    if scene.frame_current != start_frame:
+        scene.frame_set(start_frame)
+
+    # 렌더링 시작 시 키프레임 물리적 이동 보호장치 (크래쉬 후 재개 시 이중 쉬프트 방지)
+    if not scene.kf_is_shifted:
+        shift_kf_hide_render_keyframes(scene, -1.0)
+        scene.kf_is_shifted = True
 
 
 @persistent
 def kf_render_clear(scene):
-    global _is_rendering
-    _is_rendering = False
+    # 렌더 종료/취소 시 원상복구 로직 실행
+    if scene.kf_is_shifted:
+        shift_kf_hide_render_keyframes(scene, 1.0)
+        scene.kf_is_shifted = False
+
+    if scene.kf_original_frame != -1:
+        if scene.frame_current != scene.kf_original_frame:
+            scene.frame_set(scene.kf_original_frame)
+        scene.kf_original_frame = -1
 
 
 @persistent
 def kf_collection_handler(scene):
-    global _is_rendering
     ctrl_obj = scene.kf_ctrl_obj
     if not ctrl_obj:
         return
-
-    is_changed = False
 
     for item in ctrl_obj.kf_collections:
         if item.collection and item.is_managed:
             if item.collection.hide_viewport != item.kf_hide_viewport:
                 item.collection.hide_viewport = item.kf_hide_viewport
-                is_changed = True
             if item.collection.hide_render != item.kf_hide_render:
                 item.collection.hide_render = item.kf_hide_render
-                is_changed = True
-
-    if is_changed and not bpy.app.background and not _is_rendering:
-        if getattr(bpy.context, "view_layer", None):
-            bpy.context.view_layer.update()
-
-
-# --- [6.5] 이름 동기화 핸들러 (아웃라이너 이름 변경 감지) ---
-@persistent
-def kf_collection_depsgraph_handler(scene, depsgraph):
-    ctrl_obj = scene.kf_ctrl_obj
-    if not ctrl_obj:
-        return
-
-    for item in ctrl_obj.kf_collections:
-        if item.collection and item.is_managed and item.name != item.collection.name:
-            old_name = item.name
-            new_name = item.collection.name
-            item.name = new_name
-
-            if old_name == "":
-                continue
-
-            if ctrl_obj.animation_data and ctrl_obj.animation_data.action:
-                action = ctrl_obj.animation_data.action
-                for fc in action.fcurves:
-                    if f'["{old_name}"]' in fc.data_path:
-                        fc.data_path = fc.data_path.replace(
-                            f'["{old_name}"]', f'["{new_name}"]'
-                        )
-                    elif f"['{old_name}']" in fc.data_path:
-                        fc.data_path = fc.data_path.replace(
-                            f"['{old_name}']", f'["{new_name}"]'
-                        )
 
 
 # --- [7] 등록 및 해제 ---
 classes = (
     KFCollectionItem,
-    KFPopupItem,
     KFCOLLECTION_UL_list,
-    KFCOLLECTION_UL_popup_list,
-    KFCOLLECTION_OT_manage,
+    KFCOLLECTION_OT_add,
+    KFCOLLECTION_OT_remove,
     KFCOLLECTION_OT_move,
     KFCOLLECTION_PT_panel,
 )
@@ -473,22 +445,40 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    handler_lists = [
+        bpy.app.handlers.frame_change_post,
+        bpy.app.handlers.render_init,
+        bpy.app.handlers.render_complete,
+        bpy.app.handlers.render_cancel,
+    ]
+    target_names = [
+        "kf_collection_handler",
+        "kf_render_set",
+        "kf_render_clear",
+    ]
+    for h_list in handler_lists:
+        for func in reversed(h_list):
+            if hasattr(func, "__name__") and func.__name__ in target_names:
+                h_list.remove(func)
+
     bpy.types.Object.kf_collections = bpy.props.CollectionProperty(
         type=KFCollectionItem
     )
     bpy.types.Object.kf_collections_index = bpy.props.IntProperty()
-
-    bpy.types.WindowManager.kf_popup_items = bpy.props.CollectionProperty(
-        type=KFPopupItem
-    )
-    bpy.types.WindowManager.kf_popup_index = bpy.props.IntProperty()
-
     bpy.types.Scene.kf_ctrl_obj = bpy.props.PointerProperty(type=bpy.types.Object)
+
+    # 씬 종속 속성 등록 (전역 변수 대체)
+    bpy.types.Scene.kf_original_frame = bpy.props.IntProperty(default=-1)
+    bpy.types.Scene.kf_is_shifted = bpy.props.BoolProperty(default=False)
+
+    # 빈 리스트 렌더링을 위한 더미 속성
+    bpy.types.Scene.kf_dummy_collections = bpy.props.CollectionProperty(
+        type=KFCollectionItem
+    )
+    bpy.types.Scene.kf_dummy_index = bpy.props.IntProperty()
 
     if kf_collection_handler not in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.append(kf_collection_handler)
-    if kf_collection_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(kf_collection_depsgraph_handler)
 
     if kf_render_set not in bpy.app.handlers.render_init:
         bpy.app.handlers.render_init.append(kf_render_set)
@@ -503,14 +493,15 @@ def unregister():
 
     del bpy.types.Object.kf_collections
     del bpy.types.Object.kf_collections_index
-    del bpy.types.WindowManager.kf_popup_items
-    del bpy.types.WindowManager.kf_popup_index
     del bpy.types.Scene.kf_ctrl_obj
+
+    del bpy.types.Scene.kf_original_frame
+    del bpy.types.Scene.kf_is_shifted
+    del bpy.types.Scene.kf_dummy_collections
+    del bpy.types.Scene.kf_dummy_index
 
     if kf_collection_handler in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.remove(kf_collection_handler)
-    if kf_collection_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(kf_collection_depsgraph_handler)
 
     if kf_render_set in bpy.app.handlers.render_init:
         bpy.app.handlers.render_init.remove(kf_render_set)
